@@ -19,7 +19,7 @@ export default function DashboardApp(){
  const router=useRouter();const [data,setData]=useState<AnyRow|null>(null);const [tab,setTab]=useState('overview');const [toast,setToast]=useState('');const [error,setError]=useState('');
  const load=async()=>{try{setData(await request('/api/data'));setError('')}catch(e:any){setError(e.message);if(e.message.includes('hết hạn'))router.replace('/login')}};
  useEffect(()=>{load()},[]);const notify=(m:string)=>{setToast(m);setTimeout(()=>setToast(''),3500)};
- const doAction=async(name:string,payload:AnyRow)=>{try{setError('');const result=await action(name,payload);notify('Đã lưu thành công.');await load();return result}catch(e:any){setError(e.message);if(String(e.message).includes('hết hạn'))router.replace('/login');throw e}};
+ const doAction=async(name:string,payload:AnyRow)=>{try{setError('');const result=await action(name,payload);notify('Đã lưu thành công.');await load();return result}catch(e:any){setError(e.message);throw e}};
  if(!data)return <main className="login-page"><div className="login-card"><h2>{error||'Đang tải dữ liệu...'}</h2></div></main>;
  const settings=Object.fromEntries((data.settings||[]).map((x:AnyRow)=>[x.key,x.value]));
  const menus=[['overview','🏠 Tổng quan'],['issue','📤 Tiếp nhận + cấp phát'],['collection','📥 Thu gom - ra viện'],['warehouse','📦 Kho đồ vải - vật tư'],['inventory','🧮 Kiểm kê khoa'],['losses','⚠️ Mất đồ'],['tracking','📌 Theo dõi'],['reports','🔒 Báo cáo'],['settings','🔒 Cài đặt']];
