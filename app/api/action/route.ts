@@ -21,8 +21,46 @@ async function changeStock(lines: Line[], type: 'RECEIPT'|'ADMISSION_ISSUE'|'EME
     throw new Error('Vui lòng bấm chọn mặt hàng trong danh sách và nhập số lượng lớn hơn 0.');
   }
   const clean = lines.map(x => ({ itemId: String(x.itemId), quantity: Number(x.quantity) }));
-  const { error } = await s.rpc('apply_stock_transaction', { p_lines: clean, p_type: type, p_date: meta.date || new Date().toISOString().slice(0,10), p_patient_id: meta.patientId || null, p_department: meta.department || null, p_performed_by: meta.performedBy, p_note: meta.note || null });
-  if (error) throw error;
+  const transactionDate = meta.date || new Date().toISOString().slice(0,10);
+  const { error } = await s.rpc('apply_stock_transaction', { p_lines: clean, p_type: type, p_date: transactionDate, p_patient_id: meta.patientId || null, p_department: meta.department || null, p_performed_by: meta.performedBy, p_note: meta.note || null });
+  if (!error) return;
+
+  // Bản sao mới có thể chưa cài RPC kho. Chỉ nhập kho được phép dùng
+  // cơ chế dự phòng; nghiệp vụ xuất kho vẫn bắt buộc RPC để giữ kiểm tra tồn.
+  const rpcMissing = ['PGRST202', '42883'].includes(String(error.code || ''));
+  if (type !== 'RECEIPT' || !rpcMissing) throw error;
+
+  for (const line of clean) {
+    const current = await s.from('warehouse_stock')
+      .select('quantity,warning_level')
+      .eq('item_id', line.itemId)
+      .maybeSingle();
+    if (current.error) throw current.error;
+
+    const oldQuantity = Number(current.data?.quantity || 0);
+    const nextQuantity = oldQuantity + line.quantity;
+    const stockResult = current.data
+      ? await s.from('warehouse_stock')
+          .update({ quantity: nextQuantity, updated_at: new Date().toISOString() })
+          .eq('item_id', line.itemId)
+      : await s.from('warehouse_stock')
+          .insert({ item_id: line.itemId, quantity: nextQuantity, warning_level: 10 });
+    if (stockResult.error) throw stockResult.error;
+
+    const transaction = await s.from('warehouse_transactions').insert({
+      transaction_date: transactionDate,
+      transaction_type: 'RECEIPT',
+      item_id: line.itemId,
+      in_qty: line.quantity,
+      out_qty: 0,
+      balance_after: nextQuantity,
+      patient_id: null,
+      department: null,
+      performed_by: meta.performedBy,
+      note: meta.note || null
+    });
+    if (transaction.error) throw transaction.error;
+  }
 }
 
 export async function POST(request: Request) {
