@@ -1,7 +1,6 @@
 import { createClient } from '@/lib/supabase/server';
 import { db } from '@/lib/supabase';
 import { fail, ok } from '@/lib/http';
-import { APP_SESSION_COOKIE, signAppSession } from '@/lib/app-session';
 
 export async function POST(request: Request) {
   try {
@@ -39,20 +38,6 @@ export async function POST(request: Request) {
       throw new Error('Tài khoản chưa được cấp quyền hoặc đã bị khóa.');
     }
 
-    const appSession = {
-      id: data.user.id,
-      email: data.user.email || loginEmail,
-      fullName: profile.full_name || loginName,
-      role: profile.role as 'ADMIN' | 'STAFF',
-    };
-    const response = ok({ fullName: appSession.fullName, role: appSession.role });
-    response.cookies.set(APP_SESSION_COOKIE, await signAppSession(appSession), {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      path: '/',
-      maxAge: 60 * 60 * 24 * 7,
-    });
-    return response;
+    return ok({ fullName: profile.full_name, role: profile.role });
   } catch (error) { return fail(error); }
 }
