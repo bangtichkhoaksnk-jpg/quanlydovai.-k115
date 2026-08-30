@@ -116,3 +116,4 @@ Mở `http://localhost:3000`.
 
 Sau khi sửa mã và đẩy lên nhánh `main`, Vercel tự tạo bản triển khai mới. Không cần thao tác `Deploy → Manage deployments` như Google Apps Script.
 
+> Production sử dụng nhánh `main`. Không bấm **Instant Rollback** sau khi bản mới đã triển khai thành công, vì thao tác đó sẽ đưa tên miền chính quay lại mã nguồn cũ.
