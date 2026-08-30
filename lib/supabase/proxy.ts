@@ -19,27 +19,10 @@ export async function updateSession(request: NextRequest) {
     },
   });
 
-  const { data } = await supabase.auth.getClaims();
-  const authenticated = Boolean(data?.claims?.sub);
-  const path = request.nextUrl.pathname;
-  const isPublic =
-    path === '/login' ||
-    path.startsWith('/auth/callback') ||
-    path.startsWith('/api/auth/');
-
-  if (!authenticated && !isPublic) {
-    const loginUrl = request.nextUrl.clone();
-    loginUrl.pathname = '/login';
-    loginUrl.searchParams.set('next', path);
-    return NextResponse.redirect(loginUrl);
-  }
-
-  if (authenticated && path === '/login') {
-    const dashboardUrl = request.nextUrl.clone();
-    dashboardUrl.pathname = '/dashboard';
-    dashboardUrl.search = '';
-    return NextResponse.redirect(dashboardUrl);
-  }
+  // Refresh the Supabase cookie when available. Authorization is enforced by
+  // getSession/requireSession in every protected page and API route, where the
+  // current profile is also checked for active status and role.
+  await supabase.auth.getClaims();
 
   return response;
 }
