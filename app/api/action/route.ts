@@ -11,7 +11,16 @@ async function audit(user: string, action: string, entity: string, entityId = ''
 
 async function changeStock(lines: Line[], type: 'RECEIPT'|'ADMISSION_ISSUE'|'EMERGENCY_ISSUE', meta: Record<string, any>) {
   const s = db();
-  const clean = lines.map(x => ({ itemId: x.itemId, quantity: Number(x.quantity) }));
+  if (!Array.isArray(lines) || lines.length === 0) {
+    throw new Error('Chưa có mặt hàng để nhập kho.');
+  }
+  const invalidLine = lines.find(
+    x => !x?.itemId || !Number.isFinite(Number(x.quantity)) || Number(x.quantity) <= 0
+  );
+  if (invalidLine) {
+    throw new Error('Vui lòng bấm chọn mặt hàng trong danh sách và nhập số lượng lớn hơn 0.');
+  }
+  const clean = lines.map(x => ({ itemId: String(x.itemId), quantity: Number(x.quantity) }));
   const { error } = await s.rpc('apply_stock_transaction', { p_lines: clean, p_type: type, p_date: meta.date || new Date().toISOString().slice(0,10), p_patient_id: meta.patientId || null, p_department: meta.department || null, p_performed_by: meta.performedBy, p_note: meta.note || null });
   if (error) throw error;
 }
