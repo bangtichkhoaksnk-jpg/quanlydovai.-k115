@@ -1,5 +1,6 @@
 import { hash } from 'bcryptjs';
 import { db } from '@/lib/supabase';
+import { createClient as createUserClient } from '@/lib/supabase/server';
 import { requireSession } from '@/lib/auth';
 import { fail, ok } from '@/lib/http';
 
@@ -9,11 +10,30 @@ async function audit(user: string, action: string, entity: string, entityId = ''
   await db().from('audit_logs').insert({ user_name: user, action, entity, entity_id: entityId, detail });
 }
 
-async function changeStock(lines: Line[], type: 'RECEIPT'|'ADMISSION_ISSUE'|'EMERGENCY_ISSUE', meta: Record<string, any>) {
-  const s = db();
-  const clean = lines.map(x => ({ itemId: x.itemId, quantity: Number(x.quantity) }));
+function cleanStockLines(lines: unknown): Line[] {
+  if (!Array.isArray(lines) || lines.length === 0) {
+    throw new Error('Phiếu kho chưa có mặt hàng.');
+  }
+
+  const merged = new Map<string, number>();
+  for (const row of lines) {
+    const itemId = typeof row?.itemId === 'string' ? row.itemId.trim() : '';
+    const quantity = Number(row?.quantity);
+    if (!itemId) throw new Error('Vui lòng chọn đầy đủ mặt hàng.');
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      throw new Error('Số lượng nhập kho phải lớn hơn 0.');
+    }
+    merged.set(itemId, (merged.get(itemId) || 0) + quantity);
+  }
+
+  return [...merged].map(([itemId, quantity]) => ({ itemId, quantity }));
+}
+
+async function changeStock(s: any, lines: unknown, type: 'RECEIPT'|'ADMISSION_ISSUE'|'EMERGENCY_ISSUE', meta: Record<string, any>) {
+  const clean = cleanStockLines(lines);
   const { error } = await s.rpc('apply_stock_transaction', { p_lines: clean, p_type: type, p_date: meta.date || new Date().toISOString().slice(0,10), p_patient_id: meta.patientId || null, p_department: meta.department || null, p_performed_by: meta.performedBy, p_note: meta.note || null });
   if (error) throw error;
+  return clean;
 }
 
 export async function POST(request: Request) {
@@ -22,10 +42,12 @@ export async function POST(request: Request) {
     const action = body.action as string;
     const session = await requireSession(['saveSettings','saveCatalog','changePassword','saveDepartment','savePackage','savePackageItems','saveStaff'].includes(action));
     const s = db();
+    const userClient = await createUserClient();
 
     if (action === 'receiveStock') {
-      await changeStock(body.items, 'RECEIPT', { date: body.date, performedBy: body.performedBy, note: body.note });
-      await audit(session.fullName, 'NHAP_KHO', 'WAREHOUSE', '', `${body.items.length} mặt hàng`);
+      if (!body.date || !body.performedBy) throw new Error('Vui lòng chọn ngày nhập và người nhập kho.');
+      const lines = await changeStock(userClient, body.items, 'RECEIPT', { date: body.date, performedBy: body.performedBy, note: body.note });
+      await audit(session.fullName, 'NHAP_KHO', 'WAREHOUSE', '', `${lines.length} mặt hàng`);
       return ok(true);
     }
 
@@ -70,9 +92,10 @@ export async function POST(request: Request) {
     }
 
     if (action === 'emergencyIssue') {
+      if (!body.date || !body.patientId || !body.performedBy) throw new Error('Vui lòng chọn ngày cấp, bệnh nhân và nhân viên cấp.');
       const { data: patient } = await s.from('patients').select('*,departments(name)').eq('id', body.patientId).eq('status', 'ACTIVE').single();
       if (!patient) throw new Error('Không tìm thấy bệnh nhân đang điều trị.');
-      await changeStock(body.items, 'EMERGENCY_ISSUE', { date: body.date, patientId: patient.id, department: patient.departments?.name, performedBy: body.performedBy, note: body.note });
+      await changeStock(userClient, body.items, 'EMERGENCY_ISSUE', { date: body.date, patientId: patient.id, department: patient.departments?.name, performedBy: body.performedBy, note: body.note });
       await audit(session.fullName, 'CAP_DOT_XUAT', 'WAREHOUSE', patient.id, 'Không thay đổi phiếu mượn bệnh nhân');
       return ok(true);
     }
@@ -174,4 +197,3 @@ export async function POST(request: Request) {
     throw new Error('Chức năng không hợp lệ.');
   } catch (error) { return fail(error); }
 }
-
