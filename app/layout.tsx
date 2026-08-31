@@ -1,4 +1,5 @@
 import './globals.css';
+import './mobile.css';
 
 export const metadata = { title: 'Hệ thống quản lý đồ vải', description: 'Quản lý đồ vải và vật tư bệnh viện' };
 
