@@ -1,4 +1,3 @@
-import { hash } from 'bcryptjs';
 import { after } from 'next/server';
 import { db } from '@/lib/supabase';
 import { createClient as createUserClient } from '@/lib/supabase/server';
@@ -9,6 +8,11 @@ type Line = { itemId: string; quantity: number; returnedQty?: number };
 
 async function audit(user: string, action: string, entity: string, entityId = '', detail = '') {
   await db().from('audit_logs').insert({ user_name: user, action, entity, entity_id: entityId, detail });
+}
+
+function auditLater(user: string, action: string, entity: string, entityId = '', detail = '') {
+  after(() => audit(user, action, entity, entityId, detail)
+    .catch(error => console.error(`Không thể ghi nhật ký ${action}:`, error)));
 }
 
 function cleanStockLines(lines: unknown): Line[] {
@@ -67,7 +71,7 @@ export async function POST(request: Request) {
     if (action === 'receiveStock') {
       if (!body.date || !body.performedBy) throw new Error('Vui lòng chọn ngày nhập và người nhập kho.');
       const lines = await changeStock(userClient, body.items, 'RECEIPT', { date: body.date, performedBy: body.performedBy, note: body.note });
-      await audit(session.fullName, 'NHAP_KHO', 'WAREHOUSE', '', `${lines.length} mặt hàng`);
+      auditLater(session.fullName, 'NHAP_KHO', 'WAREHOUSE', '', `${lines.length} mặt hàng`);
       return ok(true);
     }
 
@@ -125,13 +129,13 @@ export async function POST(request: Request) {
       );
       if (savedItems.error) throw savedItems.error;
 
-      after(() => audit(
+      auditLater(
         session.fullName,
         existingPatient ? 'BO_SUNG_PHIEU_CU' : 'CAP_PHAT',
         'ISSUE',
         slipData!.id,
         slipData!.slip_no,
-      ).catch(error => console.error('Không thể ghi nhật ký cấp phát:', error)));
+      );
 
       return ok({ slipNo: slipData.slip_no, appended: existingPatient, itemCount: lines.length });
     }
@@ -141,7 +145,7 @@ export async function POST(request: Request) {
       const { data: patient } = await s.from('patients').select('*,departments(name)').eq('id', body.patientId).eq('status', 'ACTIVE').single();
       if (!patient) throw new Error('Không tìm thấy bệnh nhân đang điều trị.');
       await changeStock(userClient, body.items, 'EMERGENCY_ISSUE', { date: body.date, patientId: patient.id, department: patient.departments?.name, performedBy: body.performedBy, note: body.note });
-      await audit(session.fullName, 'CAP_DOT_XUAT', 'WAREHOUSE', patient.id, 'Không thay đổi phiếu mượn bệnh nhân');
+      auditLater(session.fullName, 'CAP_DOT_XUAT', 'WAREHOUSE', patient.id, 'Không thay đổi phiếu mượn bệnh nhân');
       return ok(true);
     }
 
@@ -151,15 +155,18 @@ export async function POST(request: Request) {
       const collection = await s.from('collections').insert({ patient_id: patient.id, collection_date: body.date, collector: body.collector, deliverer: body.deliverer, discharged: Boolean(body.discharged), note: body.note, image_url: body.imageUrl || null }).select().single();
       if (collection.error) throw collection.error;
       const details = body.items.map((x: any) => ({ collection_id: collection.data.id, item_id: x.itemId, borrowed_qty: Number(x.borrowedQty), returned_qty: Number(x.returnedQty), missing_qty: Math.max(0, Number(x.borrowedQty)-Number(x.returnedQty)) }));
-      const detailResult = await s.from('collection_items').insert(details);
-      if (detailResult.error) throw detailResult.error;
       const missing = details.filter((x: any) => x.missing_qty > 0).map((x: any) => ({ patient_id: patient.id, collection_id: collection.data.id, item_id: x.item_id, loss_date: body.date, quantity: x.missing_qty, reason: body.reason, resolution: body.resolution, recorder: body.collector, note: body.note }));
-      if (missing.length) { const lossResult = await s.from('losses').insert(missing); if (lossResult.error) throw lossResult.error; }
-      if (body.discharged) {
-        const discharged = await s.from('patients').update({ status: 'DISCHARGED', discharge_date: body.date, updated_at: new Date().toISOString() }).eq('id', patient.id);
-        if (discharged.error) throw discharged.error;
-      }
-      await audit(session.fullName, 'THU_GOM_RA_VIEN', 'PATIENT', patient.id, `Thiếu ${missing.length} loại`);
+      const [detailResult, lossResult, dischargeResult] = await Promise.all([
+        s.from('collection_items').insert(details),
+        missing.length ? s.from('losses').insert(missing) : Promise.resolve({ error: null }),
+        body.discharged
+          ? s.from('patients').update({ status: 'DISCHARGED', discharge_date: body.date, updated_at: new Date().toISOString() }).eq('id', patient.id)
+          : Promise.resolve({ error: null }),
+      ]);
+      if (detailResult.error) throw detailResult.error;
+      if (lossResult.error) throw lossResult.error;
+      if (dischargeResult.error) throw dischargeResult.error;
+      auditLater(session.fullName, 'THU_GOM_RA_VIEN', 'PATIENT', patient.id, `Thiếu ${missing.length} loại`);
       return ok({
         lossCount: missing.length,
         collectionId: collection.data.id,
@@ -193,7 +200,7 @@ export async function POST(request: Request) {
         note: body.note || null
       }).select().single();
       if (saved.error) throw saved.error;
-      await audit(session.fullName, 'MAT_DO', 'LOSS', saved.data.id, String(body.quantity));
+      auditLater(session.fullName, 'MAT_DO', 'LOSS', saved.data.id, String(body.quantity));
       return ok(saved.data);
     }
 
@@ -205,18 +212,23 @@ export async function POST(request: Request) {
       if (inv.error) throw inv.error;
       const rows = body.items.map((x: any) => ({ inventory_id: inv.data.id, item_id: x.itemId, expected_qty: Number(x.expectedQty), actual_qty: Number(x.actualQty) }));
       const details = await s.from('inventory_items').insert(rows); if (details.error) throw details.error;
-      await audit(session.fullName, 'KIEM_KE', 'INVENTORY', inv.data.id, body.scope);
+      auditLater(session.fullName, 'KIEM_KE', 'INVENTORY', inv.data.id, body.scope);
       return ok({ patientCount: patientResult.data.length });
     }
 
     if (action === 'saveSettings') {
-      for (const row of body.rows) { const result = await s.from('settings').upsert({ key: row.key, value: row.value, description: row.description, updated_at: new Date().toISOString() }); if (result.error) throw result.error; }
+      if (!Array.isArray(body.rows) || !body.rows.length) throw new Error('Chưa có nội dung cài đặt để lưu.');
+      const updatedAt = new Date().toISOString();
+      const rows = body.rows.map((row: any) => ({ key: row.key, value: row.value, description: row.description, updated_at: updatedAt }));
+      const result = await s.from('settings').upsert(rows, { onConflict: 'key' });
+      if (result.error) throw result.error;
       return ok(true);
     }
     if (action === 'saveCatalog') {
-      const result = await s.from('catalog_items').upsert(body.item, { onConflict: 'code' }); if (result.error) throw result.error;
-      const { data: item } = await s.from('catalog_items').select('id').eq('code', body.item.code).single();
-      await s.from('warehouse_stock').upsert({ item_id: item!.id, quantity: 0, warning_level: 10 }, { onConflict: 'item_id', ignoreDuplicates: true });
+      const result = await s.from('catalog_items').upsert(body.item, { onConflict: 'code' }).select('id').single();
+      if (result.error) throw result.error;
+      const stockResult = await s.from('warehouse_stock').upsert({ item_id: result.data.id, quantity: 0, warning_level: 10 }, { onConflict: 'item_id', ignoreDuplicates: true });
+      if (stockResult.error) throw stockResult.error;
       return ok(true);
     }
     if (action === 'saveDepartment') {
@@ -237,7 +249,9 @@ export async function POST(request: Request) {
     }
     if (action === 'changePassword') {
       if (!body.password || body.password.length < 8) throw new Error('Mật khẩu mới phải có ít nhất 8 ký tự.');
-      const result = await s.from('app_users').update({ password_hash: await hash(body.password, 12) }).eq('id', session.id); if (result.error) throw result.error; return ok(true);
+      const result = await userClient.auth.updateUser({ password: String(body.password) });
+      if (result.error) throw result.error;
+      return ok(true);
     }
     throw new Error('Chức năng không hợp lệ.');
   } catch (error) { return fail(error); }
