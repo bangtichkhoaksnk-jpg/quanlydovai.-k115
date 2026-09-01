@@ -1,4 +1,5 @@
 import { hash } from 'bcryptjs';
+import { after } from 'next/server';
 import { db } from '@/lib/supabase';
 import { createClient as createUserClient } from '@/lib/supabase/server';
 import { requireSession } from '@/lib/auth';
@@ -22,6 +23,25 @@ function cleanStockLines(lines: unknown): Line[] {
     if (!itemId) throw new Error('Vui lòng chọn đầy đủ mặt hàng.');
     if (!Number.isFinite(quantity) || quantity <= 0) {
       throw new Error('Số lượng nhập kho phải lớn hơn 0.');
+    }
+    merged.set(itemId, (merged.get(itemId) || 0) + quantity);
+  }
+
+  return [...merged].map(([itemId, quantity]) => ({ itemId, quantity }));
+}
+
+function cleanIssueLines(lines: unknown): Line[] {
+  if (!Array.isArray(lines) || lines.length === 0) {
+    throw new Error('Chưa chọn đồ cấp phát.');
+  }
+
+  const merged = new Map<string, number>();
+  for (const row of lines) {
+    const itemId = typeof row?.itemId === 'string' ? row.itemId.trim() : '';
+    const quantity = Number(row?.quantity);
+    if (!itemId) throw new Error('Vui lòng chọn đầy đủ mặt hàng.');
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      throw new Error('Số lượng cấp phát phải lớn hơn 0.');
     }
     merged.set(itemId, (merged.get(itemId) || 0) + quantity);
   }
@@ -53,19 +73,43 @@ export async function POST(request: Request) {
 
     if (action === 'saveIssue') {
       if (!body.medicalCode || !body.fullName || !body.departmentId) throw new Error('Thiếu mã KCB, họ tên hoặc khoa điều trị.');
-      if (!body.items?.length) throw new Error('Chưa chọn đồ cấp phát.');
-      let { data: patient } = await s.from('patients').select('*').eq('medical_code', body.medicalCode.trim()).maybeSingle();
+      if (!body.issueDate || !body.issuer) throw new Error('Thiếu ngày cấp hoặc nhân viên cấp.');
+      const lines = cleanIssueLines(body.items);
+      const medicalCode = body.medicalCode.trim();
+      const patientValues = {
+        full_name: body.fullName.trim(),
+        gender: body.gender,
+        department_id: body.departmentId,
+        status: 'ACTIVE',
+        discharge_date: null,
+        updated_at: new Date().toISOString(),
+      };
+      let { data: patient, error: patientError } = await s
+        .from('patients')
+        .select('id')
+        .eq('medical_code', medicalCode)
+        .maybeSingle();
+      if (patientError) throw patientError;
       const existingPatient = Boolean(patient);
       if (!patient) {
-        const created = await s.from('patients').insert({ medical_code: body.medicalCode.trim(), full_name: body.fullName.trim(), gender: body.gender, department_id: body.departmentId, admission_date: body.admissionDate, status: 'ACTIVE', note: body.patientNote }).select().single();
+        const created = await s.from('patients').insert({
+          medical_code: medicalCode,
+          full_name: patientValues.full_name,
+          gender: patientValues.gender,
+          department_id: patientValues.department_id,
+          admission_date: body.admissionDate,
+          status: 'ACTIVE',
+          note: body.patientNote,
+        }).select('id').single();
         if (created.error) throw created.error; patient = created.data;
-      } else {
-        const updated = await s.from('patients').update({ full_name: body.fullName.trim(), gender: body.gender, department_id: body.departmentId, status: 'ACTIVE', discharge_date: null, updated_at: new Date().toISOString() }).eq('id', patient.id).select().single();
-        if (updated.error) throw updated.error; patient = updated.data;
       }
       let slipData: Record<string, any> | null = null;
       if (existingPatient) {
-        const oldSlip = await s.from('issue_slips').select('*').eq('patient_id', patient.id).order('created_at',{ascending:false}).limit(1).maybeSingle();
+        const [updated, oldSlip] = await Promise.all([
+          s.from('patients').update(patientValues).eq('id', patient.id),
+          s.from('issue_slips').select('id,slip_no').eq('patient_id', patient.id).order('created_at',{ascending:false}).limit(1).maybeSingle(),
+        ]);
+        if (updated.error) throw updated.error;
         if (oldSlip.error) throw oldSlip.error;
         slipData = oldSlip.data;
       }
@@ -76,19 +120,20 @@ export async function POST(request: Request) {
         slipData = slip.data;
       }
       if (!slipData) throw new Error('Không tạo được phiếu cấp phát.');
-      const oldItems = await s.from('issue_items').select('id,item_id,quantity').eq('slip_id', slipData.id);
-      if (oldItems.error) throw oldItems.error;
-      for (const line of body.items as Line[]) {
-        const quantity = Number(line.quantity);
-        if (!line.itemId || quantity <= 0) continue;
-        const current = (oldItems.data || []).find((x: any) => x.item_id === line.itemId);
-        const saved = current
-          ? await s.from('issue_items').update({ quantity: Number(current.quantity) + quantity }).eq('id', current.id)
-          : await s.from('issue_items').insert({ slip_id: slipData.id, item_id: line.itemId, quantity });
-        if (saved.error) throw saved.error;
-      }
-      await audit(session.fullName, existingPatient?'BO_SUNG_PHIEU_CU':'CAP_PHAT', 'ISSUE', slipData.id, slipData.slip_no);
-      return ok({ slipNo: slipData.slip_no, appended: existingPatient });
+      const savedItems = await s.from('issue_items').insert(
+        lines.map(line => ({ slip_id: slipData!.id, item_id: line.itemId, quantity: line.quantity })),
+      );
+      if (savedItems.error) throw savedItems.error;
+
+      after(() => audit(
+        session.fullName,
+        existingPatient ? 'BO_SUNG_PHIEU_CU' : 'CAP_PHAT',
+        'ISSUE',
+        slipData!.id,
+        slipData!.slip_no,
+      ).catch(error => console.error('Không thể ghi nhật ký cấp phát:', error)));
+
+      return ok({ slipNo: slipData.slip_no, appended: existingPatient, itemCount: lines.length });
     }
 
     if (action === 'emergencyIssue') {

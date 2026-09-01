@@ -35,7 +35,7 @@ export default function DashboardApp(){
  const load=async()=>{try{setData(await request('/api/data'));setError('')}catch(e:any){setError(e.message);if(e.message.includes('hết hạn'))router.replace('/login')}};
  useEffect(()=>{load()},[]);const notify=(m:string)=>{setToast(m);setTimeout(()=>setToast(''),3500)};
  useEffect(()=>{const closeMenu=(event:KeyboardEvent)=>{if(event.key==='Escape')setMenuOpen(false)};window.addEventListener('keydown',closeMenu);return()=>window.removeEventListener('keydown',closeMenu)},[]);
- const performAction=async(name:string,payload:AnyRow)=>{try{setError('');const result=await action(name,payload);notify('Đã lưu thành công.');await load();return result}catch(e:any){setError(e.message);throw e}};
+ const performAction=async(name:string,payload:AnyRow)=>{try{setError('');const result=await action(name,payload);notify('Đã lưu thành công.');if(name==='saveIssue')void load();else await load();return result}catch(e:any){setError(e.message);throw e}};
  const runBusy=async<T,>(task:()=>Promise<T>)=>{if(busyRef.current)throw new Error('Hệ thống đang xử lý, vui lòng chờ.');busyRef.current=true;setBusy(true);try{return await task()}catch(e:any){setError(e?.message||'Không thể xử lý yêu cầu.');throw e}finally{busyRef.current=false;setBusy(false)}};
  const doAction=(name:string,payload:AnyRow)=>runBusy(()=>performAction(name,payload));
  if(!data)return <main className="login-page"><div className="login-card"><h2>{error||'Đang tải dữ liệu...'}</h2></div></main>;
