@@ -75,6 +75,24 @@ export async function POST(request: Request) {
       return ok(true);
     }
 
+    if (action === 'updatePatient') {
+      if (!body.patientId || !body.medicalCode || !body.fullName || !body.departmentId || !body.admissionDate) {
+        throw new Error('Thiếu thông tin bệnh nhân cần sửa.');
+      }
+      const updated = await s.from('patients').update({
+        medical_code: String(body.medicalCode).trim(),
+        full_name: String(body.fullName).trim(),
+        gender: body.gender,
+        department_id: body.departmentId,
+        admission_date: body.admissionDate,
+        note: body.patientNote || null,
+        updated_at: new Date().toISOString(),
+      }).eq('id', body.patientId).eq('status', 'ACTIVE').select('id').single();
+      if (updated.error) throw updated.error;
+      await audit(session.fullName, 'SUA_THONG_TIN_NHAP_VIEN', 'PATIENT', updated.data.id, String(body.medicalCode).trim());
+      return ok(updated.data);
+    }
+
     if (action === 'saveIssue') {
       if (!body.medicalCode || !body.fullName || !body.departmentId) throw new Error('Thiếu mã KCB, họ tên hoặc khoa điều trị.');
       if (!body.issueDate || !body.issuer) throw new Error('Thiếu ngày cấp hoặc nhân viên cấp.');
@@ -84,6 +102,7 @@ export async function POST(request: Request) {
         full_name: body.fullName.trim(),
         gender: body.gender,
         department_id: body.departmentId,
+        admission_date: body.admissionDate,
         status: 'ACTIVE',
         discharge_date: null,
         updated_at: new Date().toISOString(),
@@ -108,6 +127,7 @@ export async function POST(request: Request) {
         if (created.error) throw created.error; patient = created.data;
       }
       let slipData: Record<string, any> | null = null;
+      let newSlip = false;
       if (existingPatient) {
         const [updated, oldSlip] = await Promise.all([
           s.from('patients').update(patientValues).eq('id', patient.id),
@@ -122,12 +142,30 @@ export async function POST(request: Request) {
         const slip = await s.from('issue_slips').insert({ slip_no: slipNo, patient_id: patient.id, issue_date: body.issueDate, issuer: body.issuer, receiver: body.receiver, package_name: body.packageName, note: body.note, image_url: body.imageUrl || null }).select().single();
         if (slip.error) throw slip.error;
         slipData = slip.data;
+        newSlip = true;
       }
       if (!slipData) throw new Error('Không tạo được phiếu cấp phát.');
-      const savedItems = await s.from('issue_items').insert(
-        lines.map(line => ({ slip_id: slipData!.id, item_id: line.itemId, quantity: line.quantity })),
-      );
-      if (savedItems.error) throw savedItems.error;
+      const issueRows = lines.map(line => ({ slip_id: slipData!.id, item_id: line.itemId, quantity: line.quantity }));
+      if (newSlip) {
+        const savedItems = await s.from('issue_items').insert(issueRows);
+        if (savedItems.error) throw savedItems.error;
+      } else {
+        const oldItems = await s.from('issue_items').select('id,item_id,quantity').eq('slip_id', slipData.id);
+        if (oldItems.error) throw oldItems.error;
+        const inserts: typeof issueRows = [];
+        const updates = issueRows.flatMap(line => {
+          const current = (oldItems.data || []).find((item: any) => item.item_id === line.item_id);
+          if (!current) { inserts.push(line); return []; }
+          return [s.from('issue_items').update({ quantity: Number(current.quantity) + line.quantity }).eq('id', current.id)];
+        });
+        const updateResults = await Promise.all(updates);
+        const updateError = updateResults.find(result => result.error)?.error;
+        if (updateError) throw updateError;
+        if (inserts.length) {
+          const inserted = await s.from('issue_items').insert(inserts);
+          if (inserted.error) throw inserted.error;
+        }
+      }
 
       auditLater(
         session.fullName,
@@ -204,6 +242,16 @@ export async function POST(request: Request) {
       return ok(saved.data);
     }
 
+    if (action === 'deleteLoss') {
+      if (!body.lossId) throw new Error('Không xác định được bản ghi mất đồ cần hủy.');
+      const current = await s.from('losses').select('id,item_id,patient_id,collection_id,loss_date,quantity,reason,resolution').eq('id', body.lossId).single();
+      if (current.error) throw current.error;
+      const removed = await s.from('losses').delete().eq('id', body.lossId);
+      if (removed.error) throw removed.error;
+      await audit(session.fullName, 'HUY_MAT_DO', 'LOSS', body.lossId, JSON.stringify(current.data));
+      return ok(true);
+    }
+
     if (action === 'saveInventory') {
       const activeQuery = s.from('patients').select('id').eq('status','ACTIVE');
       const patientResult = body.scope === 'DEPARTMENT' ? await activeQuery.eq('department_id', body.departmentId) : await activeQuery;
@@ -212,8 +260,20 @@ export async function POST(request: Request) {
       if (inv.error) throw inv.error;
       const rows = body.items.map((x: any) => ({ inventory_id: inv.data.id, item_id: x.itemId, expected_qty: Number(x.expectedQty), actual_qty: Number(x.actualQty) }));
       const details = await s.from('inventory_items').insert(rows); if (details.error) throw details.error;
+      await audit(session.fullName, 'KIEM_KE_CHI_TIET', 'INVENTORY', inv.data.id, JSON.stringify(body.patientItems || []));
       auditLater(session.fullName, 'KIEM_KE', 'INVENTORY', inv.data.id, body.scope);
       return ok({ patientCount: patientResult.data.length });
+    }
+
+    if (action === 'updateInventory') {
+      if (!body.inventoryId || !Array.isArray(body.items) || !body.items.length) throw new Error('Thiếu chi tiết kiểm kê cần sửa.');
+      for (const row of body.items) {
+        if (!row.id || Number(row.expectedQty) < 0 || Number(row.actualQty) < 0) throw new Error('Số lượng kiểm kê không hợp lệ.');
+        const updated = await s.from('inventory_items').update({ expected_qty: Number(row.expectedQty), actual_qty: Number(row.actualQty) }).eq('id', row.id).eq('inventory_id', body.inventoryId);
+        if (updated.error) throw updated.error;
+      }
+      await audit(session.fullName, 'SUA_KIEM_KE', 'INVENTORY', body.inventoryId, JSON.stringify(body.items));
+      return ok(true);
     }
 
     if (action === 'saveSettings') {

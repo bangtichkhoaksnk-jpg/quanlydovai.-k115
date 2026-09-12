@@ -8,7 +8,7 @@ export async function GET() {
   try {
     const session = await requireSession();
     const s = db();
-    const [settings, departments, staff, items, packages, packageItems, patients, stock, transactions, losses, issues, collections, inventories] = await Promise.all([
+    const [settings, departments, staff, items, packages, packageItems, patients, stock, transactions, losses, issues, collections, inventories, inventoryAudits] = await Promise.all([
       s.from('settings').select('*').order('key'),
       s.from('departments').select('*').order('sort_order'),
       s.from('staff').select('*').order('full_name'),
@@ -21,9 +21,10 @@ export async function GET() {
       s.from('losses').select('*,patients(medical_code,full_name),catalog_items(name,code,unit)').order('loss_date', { ascending: false }).limit(500),
       s.from('issue_slips').select('*,patients(medical_code,full_name,departments(name)),issue_items(*,catalog_items(*))').order('created_at', { ascending: false }).limit(500),
       s.from('collections').select('*,collection_items(*,catalog_items(*))').order('created_at',{ascending:false}).limit(500),
-      s.from('inventories').select('*,departments(name),inventory_items(*)').order('inventory_time',{ascending:false}).limit(500)
+      s.from('inventories').select('*,departments(name),inventory_items(*,catalog_items(code,name,unit))').order('inventory_time',{ascending:false}).limit(500),
+      s.from('audit_logs').select('entity_id,detail').eq('action','KIEM_KE_CHI_TIET').order('created_at',{ascending:false}).limit(500)
     ]);
-    const errors = [settings, departments, staff, items, packages, packageItems, patients, stock, transactions, losses, issues, collections, inventories].map(x => x.error).filter(Boolean);
+    const errors = [settings, departments, staff, items, packages, packageItems, patients, stock, transactions, losses, issues, collections, inventories, inventoryAudits].map(x => x.error).filter(Boolean);
     if (errors.length) throw errors[0];
     const activePatients = (patients.data || []).filter((p: any) => p.status === 'ACTIVE');
     const stockRows: any[] = stock.data || [];
@@ -34,6 +35,11 @@ export async function GET() {
       lowCount: stockRows.filter((r: any) => Number(r.quantity) <= Number(r.warning_level)).length,
       outCount: stockRows.filter((r: any) => Number(r.quantity) <= 0).length
     };
-    return ok({ session, settings: settings.data, departments: departments.data, staff: staff.data, items: items.data, packages: packages.data, packageItems: packageItems.data, patients: patients.data, stock: stockRows, transactions: transactions.data, losses: losses.data, issues: issues.data, collections: collections.data, inventories: inventories.data, summary });
+    const snapshots = new Map((inventoryAudits.data || []).map((row: any) => {
+      try { return [row.entity_id, JSON.parse(row.detail || '[]')]; }
+      catch { return [row.entity_id, []]; }
+    }));
+    const inventoryRows = (inventories.data || []).map((row: any) => ({ ...row, patient_items: snapshots.get(row.id) || [] }));
+    return ok({ session, settings: settings.data, departments: departments.data, staff: staff.data, items: items.data, packages: packages.data, packageItems: packageItems.data, patients: patients.data, stock: stockRows, transactions: transactions.data, losses: losses.data, issues: issues.data, collections: collections.data, inventories: inventoryRows, summary });
   } catch (error) { return fail(error); }
 }
