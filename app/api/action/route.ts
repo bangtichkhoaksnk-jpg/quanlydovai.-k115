@@ -53,10 +53,45 @@ function cleanIssueLines(lines: unknown): Line[] {
   return [...merged].map(([itemId, quantity]) => ({ itemId, quantity }));
 }
 
+async function describeStockShortage(s: any, lines: Line[]): Promise<string | null> {
+  const itemIds = lines.map(line => line.itemId);
+  const [stockResult, itemResult] = await Promise.all([
+    s.from('warehouse_stock').select('item_id,quantity').in('item_id', itemIds),
+    s.from('catalog_items').select('id,code,name,unit').in('id', itemIds),
+  ]);
+  if (stockResult.error) throw stockResult.error;
+  if (itemResult.error) throw itemResult.error;
+
+  const stockByItem = new Map<string, number>((stockResult.data || []).map((row: any) => [row.item_id, Number(row.quantity) || 0]));
+  const itemById = new Map<string, any>((itemResult.data || []).map((row: any) => [row.id, row]));
+  const shortage = lines.find(line => !stockByItem.has(line.itemId) || (stockByItem.get(line.itemId) || 0) < line.quantity);
+  if (!shortage) return null;
+
+  const item = itemById.get(shortage.itemId);
+  const label = item?.code && item?.name
+    ? `${item.code} – ${item.name}`
+    : item?.name || `Mặt hàng ${shortage.itemId}`;
+  const unit = item?.unit || '';
+  const stock = stockByItem.get(shortage.itemId) || 0;
+  return `KHÔNG ĐỦ TỒN KHO: ${label}; tồn ${stock} ${unit}, cần ${shortage.quantity} ${unit}.`.replace(/  +/g, ' ').trim();
+}
+
 async function changeStock(s: any, lines: unknown, type: 'RECEIPT'|'ADMISSION_ISSUE'|'EMERGENCY_ISSUE', meta: Record<string, any>) {
   const clean = cleanStockLines(lines);
+  if (type !== 'RECEIPT') {
+    const shortage = await describeStockShortage(s, clean);
+    if (shortage) throw new Error(shortage);
+  }
+
   const { error } = await s.rpc('apply_stock_transaction', { p_lines: clean, p_type: type, p_date: meta.date || new Date().toISOString().slice(0,10), p_patient_id: meta.patientId || null, p_department: meta.department || null, p_performed_by: meta.performedBy, p_note: meta.note || null });
-  if (error) throw error;
+  if (error) {
+    // Bảo vệ trường hợp tồn thay đổi giữa lúc kiểm tra trước và lúc RPC khóa dòng.
+    if (type !== 'RECEIPT' && /KHÔNG ĐỦ TỒN KHO/i.test(String(error.message || ''))) {
+      const shortage = await describeStockShortage(s, clean);
+      if (shortage) throw new Error(shortage);
+    }
+    throw error;
+  }
   return clean;
 }
 
