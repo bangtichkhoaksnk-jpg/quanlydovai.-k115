@@ -75,7 +75,7 @@ function Overview({data}:{data:AnyRow}){
 
 function Issue({data,save}:{data:AnyRow,save:Function}){
  const [search,setSearch]=useState('');const [selected,setSelected]=useState<AnyRow|null>(null);const [image,setImage]=useState<File|null>(null);const [lines,setLines]=useState<Line[]>([{itemId:'',quantity:1}]);
- const active=data.patients.filter((p:AnyRow)=>{const optimisticDischargeAt=quickDischargedAt[p.id];return p.status==='ACTIVE'&&(!optimisticDischargeAt||!p.updated_at||new Date(p.updated_at).getTime()<=optimisticDischargeAt)});
+ const active=data.patients.filter((p:AnyRow)=>p.status==='ACTIVE');
  const found=search.trim()?active.filter((p:AnyRow)=>(p.medical_code+' '+p.full_name+' '+p.departments?.name).toLowerCase().includes(search.toLowerCase())).slice(0,20):[];
  const oldBorrowed=selected?borrowedFor(data,selected.id):[];
  const applyPackage=(id:string)=>{const rows=data.packageItems.filter((x:AnyRow)=>x.package_id===id&&x.active).map((x:AnyRow)=>({itemId:x.item_id,quantity:Number(x.quantity)}));if(rows.length)setLines(rows)};
@@ -124,7 +124,7 @@ function Collection({data,save}:{data:AnyRow,save:Function}){
  const [quickDischargedAt,setQuickDischargedAt]=useState<Record<string,number>>({});
  const [quickBusy,setQuickBusy]=useState('');
  const [quickError,setQuickError]=useState('');
- const active=data.patients.filter((p:AnyRow)=>p.status==='ACTIVE');
+ const active=data.patients.filter((p:AnyRow)=>{const optimisticDischargeAt=quickDischargedAt[p.id];return p.status==='ACTIVE'&&(!optimisticDischargeAt||!p.updated_at||new Date(p.updated_at).getTime()<=optimisticDischargeAt)});
  const found=search.trim()?active.filter((p:AnyRow)=>(p.medical_code+' '+p.full_name+' '+p.departments?.name).toLowerCase().includes(search.toLowerCase())).slice(0,20):[];
  const listPatients=active.filter((p:AnyRow)=>(!listDept||p.department_id===listDept)&&(!listSearch.trim()||(p.medical_code+' '+p.full_name+' '+p.departments?.name).toLowerCase().includes(listSearch.toLowerCase())));
  const choose=(p:AnyRow)=>{setPatient(p);setRows(borrowedFor(data,p.id));setSearch('');setLossReport(null)};
