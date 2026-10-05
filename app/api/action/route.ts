@@ -70,7 +70,9 @@ export async function POST(request: Request) {
 
     if (action === 'receiveStock') {
       if (!body.date || !body.performedBy) throw new Error('Vui lòng chọn ngày nhập và người nhập kho.');
-      const lines = await changeStock(s, body.items, 'RECEIPT', { date: body.date, performedBy: body.performedBy, note: body.note });
+      // RPC kiểm tra private.is_active_user() bằng auth.uid(), nên phải nhận
+      // client có cookie phiên của nhân viên; s (service role) không có auth.uid().
+      const lines = await changeStock(userClient, body.items, 'RECEIPT', { date: body.date, performedBy: body.performedBy, note: body.note });
       auditLater(session.fullName, 'NHAP_KHO', 'WAREHOUSE', '', `${lines.length} mặt hàng`);
       return ok(true);
     }
@@ -146,9 +148,9 @@ export async function POST(request: Request) {
       }
 
       // Cấp phát vào viện phải đi qua RPC khóa dòng tồn kho và chặn tồn âm.
-      // Dùng service-role client phía máy chủ vì RPC chỉ dành cho backend.
+      // Dùng client có cookie phiên để RPC xác thực đúng nhân viên đang thao tác.
       try {
-        await changeStock(s, lines, 'ADMISSION_ISSUE', {
+        await changeStock(userClient, lines, 'ADMISSION_ISSUE', {
           date: body.issueDate,
           patientId: patient.id,
           department: body.departmentName || null,
@@ -214,7 +216,7 @@ export async function POST(request: Request) {
       if (!body.date || !body.patientId || !body.performedBy) throw new Error('Vui lòng chọn ngày cấp, bệnh nhân và nhân viên cấp.');
       const { data: patient } = await s.from('patients').select('*,departments(name)').eq('id', body.patientId).eq('status', 'ACTIVE').single();
       if (!patient) throw new Error('Không tìm thấy bệnh nhân đang điều trị.');
-      await changeStock(s, body.items, 'EMERGENCY_ISSUE', { date: body.date, patientId: patient.id, department: patient.departments?.name, performedBy: body.performedBy, note: body.note });
+      await changeStock(userClient, body.items, 'EMERGENCY_ISSUE', { date: body.date, patientId: patient.id, department: patient.departments?.name, performedBy: body.performedBy, note: body.note });
       auditLater(session.fullName, 'CAP_DOT_XUAT', 'WAREHOUSE', patient.id, 'Không thay đổi phiếu mượn bệnh nhân');
       return ok(true);
     }
