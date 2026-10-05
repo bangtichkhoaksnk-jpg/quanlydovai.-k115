@@ -70,7 +70,7 @@ export async function POST(request: Request) {
 
     if (action === 'receiveStock') {
       if (!body.date || !body.performedBy) throw new Error('Vui lòng chọn ngày nhập và người nhập kho.');
-      const lines = await changeStock(userClient, body.items, 'RECEIPT', { date: body.date, performedBy: body.performedBy, note: body.note });
+      const lines = await changeStock(s, body.items, 'RECEIPT', { date: body.date, performedBy: body.performedBy, note: body.note });
       auditLater(session.fullName, 'NHAP_KHO', 'WAREHOUSE', '', `${lines.length} mặt hàng`);
       return ok(true);
     }
@@ -97,23 +97,25 @@ export async function POST(request: Request) {
       if (!body.medicalCode || !body.fullName || !body.departmentId) throw new Error('Thiếu mã KCB, họ tên hoặc khoa điều trị.');
       if (!body.issueDate || !body.issuer) throw new Error('Thiếu ngày cấp hoặc nhân viên cấp.');
       const lines = cleanIssueLines(body.items);
-      const medicalCode = body.medicalCode.trim();
+      const medicalCode = String(body.medicalCode).trim();
       const patientValues = {
-        full_name: body.fullName.trim(),
+        full_name: String(body.fullName).trim(),
         gender: body.gender,
         department_id: body.departmentId,
         admission_date: body.admissionDate,
         status: 'ACTIVE',
         discharge_date: null,
+        note: body.patientNote || null,
         updated_at: new Date().toISOString(),
       };
       let { data: patient, error: patientError } = await s
         .from('patients')
-        .select('id')
+        .select('id,status')
         .eq('medical_code', medicalCode)
         .maybeSingle();
       if (patientError) throw patientError;
       const existingPatient = Boolean(patient);
+      const wasDischarged = patient?.status === 'DISCHARGED';
       if (!patient) {
         const created = await s.from('patients').insert({
           medical_code: medicalCode,
@@ -122,24 +124,56 @@ export async function POST(request: Request) {
           department_id: patientValues.department_id,
           admission_date: body.admissionDate,
           status: 'ACTIVE',
-          note: body.patientNote,
-        }).select('id').single();
-        if (created.error) throw created.error; patient = created.data;
+          note: body.patientNote || null,
+        }).select('id,status').single();
+        if (created.error) throw created.error;
+        patient = created.data;
       }
+      if (!patient) throw new Error('Không xác định được bệnh nhân cần cấp phát.');
+      if (existingPatient) {
+        const updated = await s.from('patients').update(patientValues).eq('id', patient.id);
+        if (updated.error) throw updated.error;
+      }
+
       let slipData: Record<string, any> | null = null;
       let newSlip = false;
-      if (existingPatient) {
-        const [updated, oldSlip] = await Promise.all([
-          s.from('patients').update(patientValues).eq('id', patient.id),
-          s.from('issue_slips').select('id,slip_no').eq('patient_id', patient.id).order('created_at',{ascending:false}).limit(1).maybeSingle(),
-        ]);
-        if (updated.error) throw updated.error;
+      let appended = false;
+      if (existingPatient && !wasDischarged) {
+        const oldSlip = await s.from('issue_slips').select('id,slip_no').eq('patient_id', patient.id).order('created_at',{ascending:false}).limit(1).maybeSingle();
         if (oldSlip.error) throw oldSlip.error;
         slipData = oldSlip.data;
+        appended = Boolean(slipData);
       }
+
+      // Cấp phát vào viện phải đi qua RPC khóa dòng tồn kho và chặn tồn âm.
+      // Dùng service-role client phía máy chủ vì RPC chỉ dành cho backend.
+      try {
+        await changeStock(s, lines, 'ADMISSION_ISSUE', {
+          date: body.issueDate,
+          patientId: patient.id,
+          department: body.departmentName || null,
+          performedBy: body.issuer,
+          note: body.note || body.packageName || null,
+        });
+      } catch (error) {
+        if (!existingPatient) {
+          await s.from('patients').delete().eq('id', patient.id);
+        }
+        throw error;
+      }
+
       if (!slipData) {
-        const slipNo = `CP-${Date.now().toString(36).toUpperCase()}`;
-        const slip = await s.from('issue_slips').insert({ slip_no: slipNo, patient_id: patient.id, issue_date: body.issueDate, issuer: body.issuer, receiver: body.receiver, package_name: body.packageName, note: body.note, image_url: body.imageUrl || null }).select().single();
+        const slipNo = 'CP-' + Date.now().toString(36).toUpperCase();
+        const slip = await s.from('issue_slips').insert({
+          slip_no: slipNo,
+          patient_id: patient.id,
+          issue_date: body.issueDate,
+          issuer: body.issuer,
+          receiver: body.receiver,
+          package_name: body.packageName,
+          note: body.note,
+          image_url: body.imageUrl || null,
+        }).select().single();
         if (slip.error) throw slip.error;
         slipData = slip.data;
         newSlip = true;
@@ -169,20 +203,18 @@ export async function POST(request: Request) {
 
       auditLater(
         session.fullName,
-        existingPatient ? 'BO_SUNG_PHIEU_CU' : 'CAP_PHAT',
+        appended ? 'BO_SUNG_PHIEU_CU' : wasDischarged ? 'TAI_NHAP_VIEN_CAP_PHAT' : 'CAP_PHAT',
         'ISSUE',
         slipData!.id,
         slipData!.slip_no,
       );
-
-      return ok({ slipNo: slipData.slip_no, appended: existingPatient, itemCount: lines.length });
+      return ok({ slipNo: slipData.slip_no, appended, reAdmitted: wasDischarged, itemCount: lines.length });
     }
-
     if (action === 'emergencyIssue') {
       if (!body.date || !body.patientId || !body.performedBy) throw new Error('Vui lòng chọn ngày cấp, bệnh nhân và nhân viên cấp.');
       const { data: patient } = await s.from('patients').select('*,departments(name)').eq('id', body.patientId).eq('status', 'ACTIVE').single();
       if (!patient) throw new Error('Không tìm thấy bệnh nhân đang điều trị.');
-      await changeStock(userClient, body.items, 'EMERGENCY_ISSUE', { date: body.date, patientId: patient.id, department: patient.departments?.name, performedBy: body.performedBy, note: body.note });
+      await changeStock(s, body.items, 'EMERGENCY_ISSUE', { date: body.date, patientId: patient.id, department: patient.departments?.name, performedBy: body.performedBy, note: body.note });
       auditLater(session.fullName, 'CAP_DOT_XUAT', 'WAREHOUSE', patient.id, 'Không thay đổi phiếu mượn bệnh nhân');
       return ok(true);
     }
