@@ -95,7 +95,7 @@ export async function POST(request: Request) {
 
     if (action === 'saveIssue') {
       if (!body.medicalCode || !body.fullName || !body.departmentId) throw new Error('Thiếu mã KCB, họ tên hoặc khoa điều trị.');
-      if (!body.issueDate || !body.issuer) throw new Error('Thiếu ngày cấp hoặc nhân viên cấp.');
+      if (!body.issueDate || !body.issuer || !body.admissionDate) throw new Error('Thiếu ngày vào viện, ngày cấp hoặc nhân viên cấp.');
       const lines = cleanIssueLines(body.items);
       const medicalCode = String(body.medicalCode).trim();
       const patientValues = {
@@ -220,14 +220,45 @@ export async function POST(request: Request) {
     }
 
     if (action === 'collectDischarge') {
+      if (!body.patientId || !body.date || !String(body.collector || '').trim()) {
+        throw new Error('Vui lòng chọn bệnh nhân, ngày thu gom và nhân viên thu gom.');
+      }
+      if (!Array.isArray(body.items)) throw new Error('Danh sách đồ thu gom không hợp lệ.');
       const { data: patient } = await s.from('patients').select('*').eq('id', body.patientId).eq('status', 'ACTIVE').single();
       if (!patient) throw new Error('Không tìm thấy bệnh nhân đang điều trị.');
-      const collection = await s.from('collections').insert({ patient_id: patient.id, collection_date: body.date, collector: body.collector, deliverer: body.deliverer, discharged: Boolean(body.discharged), note: body.note, image_url: body.imageUrl || null }).select().single();
+      const details = body.items.map((x: any) => ({
+        collection_id: '',
+        item_id: x.itemId,
+        borrowed_qty: Number(x.borrowedQty),
+        returned_qty: Number(x.returnedQty),
+        missing_qty: Math.max(0, Number(x.borrowedQty) - Number(x.returnedQty)),
+      }));
+      if (details.some((x: any) => !x.item_id || !Number.isFinite(x.borrowed_qty) || x.borrowed_qty < 0 || !Number.isFinite(x.returned_qty) || x.returned_qty < 0 || x.returned_qty > x.borrowed_qty)) {
+        throw new Error('Số lượng thu gom không hợp lệ: số trả không được lớn hơn số đang mượn.');
+      }
+      const collection = await s.from('collections').insert({
+        patient_id: patient.id,
+        collection_date: body.date,
+        collector: String(body.collector).trim(),
+        deliverer: body.deliverer,
+        discharged: Boolean(body.discharged),
+        note: body.note,
+        image_url: body.imageUrl || null,
+      }).select().single();
       if (collection.error) throw collection.error;
-      const details = body.items.map((x: any) => ({ collection_id: collection.data.id, item_id: x.itemId, borrowed_qty: Number(x.borrowedQty), returned_qty: Number(x.returnedQty), missing_qty: Math.max(0, Number(x.borrowedQty)-Number(x.returnedQty)) }));
-      const missing = details.filter((x: any) => x.missing_qty > 0).map((x: any) => ({ patient_id: patient.id, collection_id: collection.data.id, item_id: x.item_id, loss_date: body.date, quantity: x.missing_qty, reason: body.reason, resolution: body.resolution, recorder: body.collector, note: body.note }));
+      const collectionDetails = details.map((x: any) => ({ ...x, collection_id: collection.data.id }));
+      const missing = collectionDetails.filter((x: any) => x.missing_qty > 0).map((x: any) => ({
+        patient_id: patient.id,
+        collection_id: collection.data.id,
+        item_id: x.item_id,
+        loss_date: body.date,
+        quantity: x.missing_qty,
+        reason: body.reason,
+        resolution: body.resolution,
+        recorder: session.fullName,
+      }));
       const [detailResult, lossResult, dischargeResult] = await Promise.all([
-        s.from('collection_items').insert(details),
+        collectionDetails.length ? s.from('collection_items').insert(collectionDetails) : Promise.resolve({ error: null }),
         missing.length ? s.from('losses').insert(missing) : Promise.resolve({ error: null }),
         body.discharged
           ? s.from('patients').update({ status: 'DISCHARGED', discharge_date: body.date, updated_at: new Date().toISOString() }).eq('id', patient.id)
@@ -236,12 +267,12 @@ export async function POST(request: Request) {
       if (detailResult.error) throw detailResult.error;
       if (lossResult.error) throw lossResult.error;
       if (dischargeResult.error) throw dischargeResult.error;
-      auditLater(session.fullName, 'THU_GOM_RA_VIEN', 'PATIENT', patient.id, `Thiếu ${missing.length} loại`);
+      auditLater(session.fullName, 'THU_GOM_RA_VIEN', 'PATIENT', patient.id, 'Thiếu ' + missing.length + ' loại');
       return ok({
         lossCount: missing.length,
         collectionId: collection.data.id,
-        collectionNo: `TG-${String(collection.data.id).slice(0,8).toUpperCase()}`,
-        missing: details.filter((x: any) => x.missing_qty > 0),
+        collectionNo: 'TG-' + String(collection.data.id).slice(0,8).toUpperCase(),
+        missing: collectionDetails.filter((x: any) => x.missing_qty > 0),
         patient: { medicalCode: body.medicalCode || '', fullName: body.fullName || '', department: body.departmentName || '' },
         collector: body.collector,
         deliverer: body.deliverer,
@@ -250,7 +281,6 @@ export async function POST(request: Request) {
         resolution: body.resolution || 'Tiếp tục xác minh và xử lý theo quy định của bệnh viện.'
       });
     }
-
     if (action === 'saveLoss') {
       if (!body.itemId || !body.lossDate || Number(body.quantity) <= 0) throw new Error('Thiếu ngày, mặt hàng hoặc số lượng mất.');
       let patientId: string | null = body.patientId || null;
